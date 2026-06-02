@@ -1,0 +1,118 @@
+name: ProductFlow Health Diff
+
+# Сравнивает health-находки и ошибки между base и PR-веткой.
+# Постит комментарий: что ушло ✅ и что добавилось ⚠️/❌.
+# Не блокирует PR — только информирует (жёсткий гейт — в pflow-check.yml).
+#
+# Полностью локальный: использует вендоренный бандл `.pflow/mcp/pflow-mcp.cjs`
+# из HEAD-ветки (его кладёт команда расширения «Подключить MCP-сервер
+# к текущему проекту»). Если бандла нет ни в HEAD, ни в base — шаг graceful
+# деградирует к пустому отчёту, а не падает.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  diff:
+    name: pflow diff
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Check HEAD
+        run: |
+          if [ -f .pflow/mcp/pflow-mcp.cjs ]; then
+            node .pflow/mcp/pflow-mcp.cjs check . --json > /tmp/head.json || true
+          else
+            echo '{"diagnostics":[],"health":[]}' > /tmp/head.json
+          fi
+
+      - name: Check BASE
+        run: |
+          git worktree add /tmp/base ${{ github.event.pull_request.base.sha }}
+          # используем бинарь из HEAD — в base его может не быть
+          if [ -f .pflow/mcp/pflow-mcp.cjs ]; then
+            node .pflow/mcp/pflow-mcp.cjs check /tmp/base --json > /tmp/base.json || true
+          else
+            echo '{"diagnostics":[],"health":[]}' > /tmp/base.json
+          fi
+          git worktree remove /tmp/base --force
+
+      - name: Post diff comment
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+
+            let head, base;
+            try { head = JSON.parse(fs.readFileSync('/tmp/head.json', 'utf8')); } catch { head = {}; }
+            try { base = JSON.parse(fs.readFileSync('/tmp/base.json', 'utf8')); } catch { base = {}; }
+
+            const diagKey   = d => `${d.severity}::${(d.message||'').slice(0, 120)}`;
+            const healthKey = h => `${h.aspect_id}::${h.entity?.type}::${h.entity?.name}`;
+
+            const baseDiagKeys   = new Set((base.diagnostics||[]).map(diagKey));
+            const headDiagKeys   = new Set((head.diagnostics||[]).map(diagKey));
+            const baseHealthKeys = new Set((base.health||[]).map(healthKey));
+            const headHealthKeys = new Set((head.health||[]).map(healthKey));
+
+            const fixedDiag   = (base.diagnostics||[]).filter(d => !headDiagKeys.has(diagKey(d)));
+            const addedDiag   = (head.diagnostics||[]).filter(d => !baseDiagKeys.has(diagKey(d)));
+            const fixedHealth = (base.health||[]).filter(h => !headHealthKeys.has(healthKey(h)));
+            const addedHealth = (head.health||[]).filter(h => !baseHealthKeys.has(healthKey(h)));
+
+            const total = fixedDiag.length + addedDiag.length + fixedHealth.length + addedHealth.length;
+
+            const fmt = (severity) => severity === 'error' ? '🔴' : severity === 'warning' ? '🟡' : '⚪';
+
+            const lines = ['### 🔍 ProductFlow Health Diff'];
+
+            if (total === 0) {
+              lines.push('', '_Ошибок и health-находок не добавилось и не ушло._');
+            } else {
+              if (fixedDiag.length > 0) {
+                lines.push('', `**✅ Ошибки исправлены (${fixedDiag.length}):**`);
+                fixedDiag.forEach(d => lines.push(`- ${fmt(d.severity)} \`${d.severity}\` — ${d.message}`));
+              }
+              if (addedDiag.length > 0) {
+                lines.push('', `**❌ Новые ошибки (${addedDiag.length}):**`);
+                addedDiag.forEach(d => lines.push(`- ${fmt(d.severity)} \`${d.severity}\` — ${d.message}`));
+              }
+              if (fixedHealth.length > 0) {
+                lines.push('', `**✅ Health-находки ушли (${fixedHealth.length}):**`);
+                fixedHealth.forEach(h => lines.push(`- ${fmt(h.severity)} ${h.entity?.type} «${h.entity?.name}» — ${h.message}`));
+              }
+              if (addedHealth.length > 0) {
+                lines.push('', `**⚠️ Новые health-находки (${addedHealth.length}):**`);
+                addedHealth.forEach(h => lines.push(`- ${fmt(h.severity)} ${h.entity?.type} «${h.entity?.name}» — ${h.message}`));
+              }
+            }
+
+            const body = lines.join('\n');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.user?.type === 'Bot' && c.body?.includes('ProductFlow Health Diff'));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo, comment_id: existing.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body,
+              });
+            }

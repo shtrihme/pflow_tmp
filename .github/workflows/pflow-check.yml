@@ -1,0 +1,72 @@
+name: ProductFlow Check
+
+# PR-гейт: гоняет те же валидации и health-чекеры, что MCP-сервер, прямо в CI.
+# Полностью локальный — без внешних сервисов и без npm-реестра: использует
+# вендоренный бандл `.pflow/mcp/pflow-mcp.cjs` (его кладёт команда расширения
+# «ProductFlow: Подключить MCP-сервер к текущему проекту»).
+#
+# Падает (красный чек), если есть ошибки парсинга/валидации или health-находки
+# уровня --max-severity и выше. Порог по умолчанию — critical (реальная
+# некорректность модели). attention-находки (гипотезы без опоры, orphans,
+# слабая юнит-экономика) попадают в отчёт-комментарий, но PR не блокируют —
+# это нормальный discovery-долг. Ужесточить до attention для зрелого проекта
+# можно, добавив `--max-severity attention` ниже.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  check:
+    name: pflow check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run pflow check
+        id: check
+        run: |
+          if [ ! -f .pflow/mcp/pflow-mcp.cjs ]; then
+            echo "::error::Не найден .pflow/mcp/pflow-mcp.cjs — выполни команду расширения «Подключить MCP-сервер к текущему проекту» и закоммить файл."
+            exit 1
+          fi
+          set +e
+          node .pflow/mcp/pflow-mcp.cjs check . | tee check.txt
+          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Post or update PR comment
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.existsSync('check.txt') ? fs.readFileSync('check.txt', 'utf8') : '(нет вывода)';
+            const ok = '${{ steps.check.outputs.exit_code }}' === '0';
+            const body = [
+              `### ${ok ? '✅' : '❌'} ProductFlow Check`,
+              '',
+              '```',
+              report.trim(),
+              '```',
+            ].join('\n');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.user?.type === 'Bot' && c.body?.includes('ProductFlow Check'));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner: context.repo.owner, repo: context.repo.repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body });
+            }
+
+      - name: Fail if check failed
+        if: steps.check.outputs.exit_code != '0'
+        run: exit 1

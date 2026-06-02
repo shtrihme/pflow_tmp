@@ -1,0 +1,141 @@
+name: ProductFlow Viewer
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  prebuild:
+    name: Prebuild snapshot + diff & post viewer link
+    runs-on: ubuntu-latest
+    # Нужны права на запись комментариев к PR.
+    permissions:
+      pull-requests: write
+
+    steps:
+      - name: Prebuild snapshot
+        id: prebuild
+        # Viewer — внешний сервис (vars.PFLOW_VIEWER_URL / secrets.PFLOW_PREBUILD_TOKEN).
+        # Если он не сконфигурирован или недоступен — это не должно валить PR:
+        # viewer-ссылка приятна, но не блокер. Шаг комментария ниже пропускается,
+        # если prebuild не удался, — чтобы не постить битую ссылку.
+        continue-on-error: true
+        env:
+          PFLOW_VIEWER_URL: ${{ vars.PFLOW_VIEWER_URL }}
+          PFLOW_PREBUILD_TOKEN: ${{ secrets.PFLOW_PREBUILD_TOKEN }}
+        run: |
+          RESPONSE=$(curl -sf -X POST "${PFLOW_VIEWER_URL}/api/prebuild" \
+            -H "Authorization: Bearer ${PFLOW_PREBUILD_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "owner":       "${{ github.repository_owner }}",
+              "repo":        "${{ github.event.repository.name }}",
+              "sha":         "${{ github.event.pull_request.head.sha }}",
+              "ref":         "${{ github.event.pull_request.head.ref }}",
+              "accessToken": "${{ secrets.GITHUB_TOKEN }}"
+            }')
+          echo "viewer_url=$(echo $RESPONSE | jq -r '.viewerUrl')" >> $GITHUB_OUTPUT
+          echo "sha=$(echo $RESPONSE | jq -r '.sha')" >> $GITHUB_OUTPUT
+
+      - name: Prediff (base ↔ head)
+        id: prediff
+        env:
+          PFLOW_VIEWER_URL: ${{ vars.PFLOW_VIEWER_URL }}
+          PFLOW_PREBUILD_TOKEN: ${{ secrets.PFLOW_PREBUILD_TOKEN }}
+        # Diff cold-path может занять до 90s (два checkout'а + LLM-narrative),
+        # поэтому отдельным шагом. Если падает — PR не блокируется (continue-on-error),
+        # viewer-ссылка всё равно постится.
+        continue-on-error: true
+        run: |
+          RESPONSE=$(curl -sf -X POST "${PFLOW_VIEWER_URL}/api/prediff" \
+            -H "Authorization: Bearer ${PFLOW_PREBUILD_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "owner":       "${{ github.repository_owner }}",
+              "repo":        "${{ github.event.repository.name }}",
+              "baseSha":     "${{ github.event.pull_request.base.sha }}",
+              "headSha":     "${{ github.event.pull_request.head.sha }}",
+              "baseRef":     "${{ github.event.pull_request.base.ref }}",
+              "headRef":     "${{ github.event.pull_request.head.ref }}",
+              "accessToken": "${{ secrets.GITHUB_TOKEN }}"
+            }') || true
+          if [ -n "$RESPONSE" ]; then
+            echo "compare_url=$(echo $RESPONSE | jq -r '.compareUrl // empty')" >> $GITHUB_OUTPUT
+            echo "changed_entities=$(echo $RESPONSE | jq -r '.summary.changedEntities // 0')" >> $GITHUB_OUTPUT
+            echo "added_entities=$(echo $RESPONSE | jq -r '.summary.addedEntities // 0')" >> $GITHUB_OUTPUT
+            echo "removed_entities=$(echo $RESPONSE | jq -r '.summary.removedEntities // 0')" >> $GITHUB_OUTPUT
+            # roll-up может быть многострочным — оборачиваем для GITHUB_OUTPUT
+            ROLLUP=$(echo $RESPONSE | jq -r '.rollUp // empty')
+            EOF=$(openssl rand -hex 8)
+            echo "roll_up<<$EOF" >> $GITHUB_OUTPUT
+            echo "$ROLLUP" >> $GITHUB_OUTPUT
+            echo "$EOF" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Post or update PR comment
+        if: steps.prebuild.outcome == 'success'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const viewerUrl  = '${{ steps.prebuild.outputs.viewer_url }}';
+            const sha        = '${{ steps.prebuild.outputs.sha }}';
+            const baseRef    = '${{ github.event.pull_request.base.ref }}';
+            const compareUrl = `${{ steps.prediff.outputs.compare_url }}`;
+            const changed    = parseInt(`${{ steps.prediff.outputs.changed_entities }}` || '0', 10);
+            const added      = parseInt(`${{ steps.prediff.outputs.added_entities }}` || '0', 10);
+            const removed    = parseInt(`${{ steps.prediff.outputs.removed_entities }}` || '0', 10);
+            const rollUp     = `${{ steps.prediff.outputs.roll_up }}`.trim();
+
+            const lines = [
+              '### 🔍 ProductFlow Viewer',
+              '',
+              `**SHA**: \`${sha.slice(0, 7)}\` | **Base**: \`${baseRef}\``,
+              '',
+              `[Открыть в ProductFlow Viewer](${viewerUrl})`,
+            ];
+
+            if (compareUrl) {
+              lines.push('', '---', '', '### 📊 Сравнение base ↔ head');
+              if (changed > 0) {
+                const parts = [];
+                if (added)   parts.push(`+${added} новых`);
+                if (removed) parts.push(`-${removed} удалённых`);
+                const modified = changed - added - removed;
+                if (modified > 0) parts.push(`${modified} изменённых`);
+                lines.push('', `**Изменено сущностей**: ${changed} (${parts.join(', ')})`);
+              } else {
+                lines.push('', 'DSL-блоки сущностей идентичны.');
+              }
+              if (rollUp) {
+                lines.push('', `> ${rollUp.split('\n').join('\n> ')}`);
+              }
+              lines.push('', `[Открыть подробный diff](${compareUrl})`);
+            }
+
+            const body = lines.join('\n');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner:       context.repo.owner,
+              repo:        context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(c =>
+              c.user?.type === 'Bot' && c.body?.includes('ProductFlow Viewer')
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner:      context.repo.owner,
+                repo:       context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner:       context.repo.owner,
+                repo:        context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
